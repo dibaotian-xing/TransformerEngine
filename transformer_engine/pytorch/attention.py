@@ -1573,6 +1573,65 @@ def reorder_seq_chunks_for_a2a(x, chunk_ids_for_a2a, seq_dim, cp_size, before_at
     return x
 
 
+@torch.compile
+def reorder_seq_chunks_for_heter(
+    x,
+    seqlen_per_gpu,
+    headnum_per_gpu,
+    seqlen_tot,
+    headnum_tot,
+    seqlen_this_rank,
+    headnum_this_rank, 
+    seq_dim,
+    cp_size,
+    before_attn,
+):
+    "Reorder sequence chunk for heterogeneous Ulysses"
+    device = x.device
+    seqlen_per_gpu = seqlen_per_gpu.to(device=device)
+    headnum_per_gpu = headnum_per_gpu.to(device=device)
+
+    if before_attn:
+        # x: [np_i * seqlen_0 + np_i * seqlen_1 + ... + np_i * seqlen_(cp_size-1), b, hn]
+        # result: [b, seqlen_tot, np_i, hn] or [seqlen_tot, b, np_i, hn]
+        presum = torch.cumsum(seqlen_per_gpu, dim=0) - seqlen_per_gpu
+        indices_per_cp = []
+        for cp_rank in range(cp_size):
+            seq_len = seqlen_per_gpu[cp_rank]
+            base = presum[cp_rank] * headnum_this_rank
+            head_offsets = torch.arange(headnum_this_rank, device=device, dtype=torch.long).unsqueeze(1) * seq_len
+            seq_offsets = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+            indices_cp = base + head_offsets + seq_offsets
+            indices_per_cp.append(indices_cp)
+        indices_per_head = torch.cat(indices_per_cp, dim=1)
+        idx_all = indices_per_head.reshape(-1).to(dtype=torch.long)
+        result = x.index_select(dim=0, index=idx_all)
+        result = result.view(headnum_this_rank, seqlen_tot, result.shape[-2], result.shape[-1])
+        # [np_i, seqlen_tot, b, hn] -> [b, seqlen_tot, np_i, hn]
+        # or [np_i, seqlen_tot, b, hn] -> [seqlen_tot, b, np_i, hn]
+        result = result.movedim(-2, 0).movedim(2, seq_dim)
+    else:
+        # x: [seqlen_i * np_0 + seqlen_i * np_1 + ... + seqlen_i * np_(cp_size-1), b, hn]
+        # result: [b, seqlen_i, np, hn] or [seqlen_i, b, np, hn]
+        presum = torch.cumsum(headnum_per_gpu, dim=0) - headnum_per_gpu
+        indices_per_cp = []
+        for cp_rank in range(cp_size):
+            headnum = headnum_per_gpu[cp_rank]
+            base = presum[cp_rank] * seqlen_this_rank
+            head_offsets = torch.arange(headnum, device=device, dtype=torch.long).unsqueeze(0)
+            seq_offsets = torch.arange(seqlen_this_rank, device=device, dtype=torch.long).unsqueeze(1) * headnum
+            indices_cp = base + head_offsets + seq_offsets
+            indices_per_cp.append(indices_cp)
+        indices_per_token = torch.cat(indices_per_cp, dim=1)
+        idx_all = indices_per_token.reshape(-1).to(dtype=torch.long)
+        result = x.index_select(dim=0, index=idx_all)
+        result = result.view(seqlen_this_rank, headnum_tot, result.shape[-2], result.shape[-1])
+        # [seqlen_i, np, b, hn] -> [b, seqlen_i, np, hn]
+        # or [seqlen_i, np, b, hn] -> [seqlen_i, b, np, hn]
+        result = result.movedim(1,-2).movedim(0, seq_dim)
+    return result.contiguous()
+
+
 def flash_attn_a2a_communicate(
     a2a_inputs: Union[torch.Tensor, List[torch.Tensor]],
     chunk_ids_for_a2a: torch.Tensor,
@@ -1637,6 +1696,115 @@ def flash_attn_a2a_communicate(
                     # [b, 2, s//2, cp, np//cp, hn] -> [b*s, np, hn]
                     # or [2, s//2, b, cp, np//cp, hn] -> [s*b, np, hn]
                     a2a_outputs[i - 2] = x.view(-1, x.shape[-3] * x.shape[-2], x.shape[-1])
+    torch.cuda.current_stream().wait_stream(cp_stream)
+    return a2a_outputs[0] if len(a2a_inputs) == 1 else a2a_outputs
+
+
+def flash_attn_a2a_communicate_heter(
+    a2a_inputs: Union[torch.Tensor, List[torch.Tensor]],
+    seq_dim: int,
+    seqlen_tot: int,
+    headnum_tot: List[int],
+    seqlen_per_gpu: torch.Tensor,
+    headnum_per_gpu: List[torch.Tensor],
+    cp_size: int,
+    cp_group: dist_group_type,
+    cp_stream: torch.cuda.Stream,
+    before_attn: bool,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    """A2A communication for heterogeneous context parallelism."""
+    a2a_inputs = [a2a_inputs] if not isinstance(a2a_inputs, list) else a2a_inputs
+    assert len(a2a_inputs) == len(headnum_tot)
+    assert len(a2a_inputs) == len(headnum_per_gpu)
+    a2a_outputs, a2a_reqs = [None] * len(a2a_inputs), [None] * len(a2a_inputs)
+    cp_rank = torch.distributed.get_rank(cp_group)
+    if before_attn:
+        # a2a_inputs: [b, s_ranki, np, hn] or [s_ranki, b, np, hn]
+        # a2a_outputs: [b, s_tot, np_i, hn] or [s_tot, b, np_i, hn]
+        for i in range(len(a2a_inputs) + 2):
+            if 0 < i < len(a2a_inputs) + 1:
+                x = a2a_inputs[i - 1]
+                a2a_outputs[i - 1] = torch.empty(
+                    int((seqlen_tot * headnum_per_gpu[i - 1][cp_rank]).item()),  
+                    *x.shape[-2:], 
+                    dtype = x.dtype,
+                    device = x.device,
+                    requires_grad = x.requires_grad
+                )
+                input_split_sizes = headnum_per_gpu[i - 1].tolist()
+                input_split_sizes = [np * int(seqlen_per_gpu[cp_rank].item()) for np in input_split_sizes]
+                output_split_sizes = seqlen_per_gpu.tolist()
+                output_split_sizes = [sl * int(headnum_per_gpu[i - 1][cp_rank].item()) for sl in output_split_sizes]
+                a2a_reqs[i - 1] = torch.distributed.all_to_all_single(
+                    a2a_outputs[i - 1], 
+                    a2a_inputs[i - 1],
+                    input_split_sizes=input_split_sizes,
+                    output_split_sizes=output_split_sizes, 
+                    group=cp_group, 
+                    async_op=True
+                )
+            if i > 1:
+                with torch.cuda.stream(cp_stream):
+                    a2a_reqs[i - 2].wait()
+                    x = a2a_outputs[i - 2]
+                    # reorder the sequence chunks
+                    x = reorder_seq_chunks_for_heter(
+                        x, seqlen_per_gpu, headnum_per_gpu[i - 2], seqlen_tot, headnum_tot[i - 2], \
+                        int(seqlen_per_gpu[cp_rank].item()), int(headnum_per_gpu[i - 2][cp_rank].item()),\
+                        seq_dim, cp_size, before_attn
+                    )
+                    a2a_outputs[i - 2] = x
+            if i < len(a2a_inputs):
+                x = a2a_inputs[i]
+                # [b, s_ranki, np, hn] -> [np, s_ranki, b, hn]
+                # or [s_ranki, b, np, hn] -> [np, s_ranki, b, hn]
+                x = x.movedim(seq_dim, 0).movedim(-2, 0).contiguous()
+                # [np, s_ranki, b, hn] -> [np*s_ranki, b, hn]
+                x = x.view(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])
+                a2a_inputs[i] = x
+    else:
+        # a2a_inputs: [b, s_tot, np_i, hn] or [s_tot, b, np_i, hn]
+        # a2a_outputs: [b*s_ranki, np, hn] or [s_ranki*b, np, hn]
+        for i in range(len(a2a_inputs) + 2):
+            if 0 < i < len(a2a_inputs) + 1:
+                x = a2a_inputs[i - 1]
+                a2a_outputs[i - 1] = torch.empty(
+                    int((headnum_tot[i - 1] * seqlen_per_gpu[cp_rank]).item()),  
+                    *x.shape[-2:], 
+                    dtype = x.dtype,
+                    device = x.device,
+                    requires_grad = x.requires_grad
+                )
+                input_split_sizes = seqlen_per_gpu.tolist()
+                input_split_sizes = [sl * int(headnum_per_gpu[i - 1][cp_rank].item()) for sl in input_split_sizes]
+                output_split_sizes = headnum_per_gpu[i - 1].tolist()
+                output_split_sizes = [np * int(seqlen_per_gpu[cp_rank].item()) for np in output_split_sizes]
+                a2a_reqs[i - 1] = torch.distributed.all_to_all_single(
+                    a2a_outputs[i - 1], 
+                    a2a_inputs[i - 1],
+                    input_split_sizes=input_split_sizes,
+                    output_split_sizes=output_split_sizes, 
+                    group=cp_group, 
+                    async_op=True
+                )
+            if i < len(a2a_inputs):
+                x = a2a_inputs[i]
+                # [b, s_tot, np_i, hn] -> [s_tot, np_i, b, hn]
+                # or [s_tot, b, np_i, hn] -> [s_tot, np_i, b, hn]
+                x = x.movedim(seq_dim, 0).movedim(-2, 1).contiguous()
+                # [s_tot, np_i, b, hn] -> [s_tot*np_i, b, hn]
+                a2a_inputs[i] = x.view(x.shape[0]*x.shape[1],*x.shape[-2:])
+            if i > 1:
+                with torch.cuda.stream(cp_stream):
+                    a2a_reqs[i - 2].wait()
+                    x = a2a_outputs[i - 2]
+                    # reorder the sequence chunks
+                    x = reorder_seq_chunks_for_heter(
+                        x, seqlen_per_gpu, headnum_per_gpu[i - 2], seqlen_tot, headnum_tot[i - 2], \
+                        int(seqlen_per_gpu[cp_rank].item()), int(headnum_per_gpu[i - 2][cp_rank].item()),\
+                        seq_dim, cp_size, before_attn
+                    )
+                    a2a_outputs[i - 2] = x.view(x.shape[0] * x.shape[1],*x.shape[-2:])
     torch.cuda.current_stream().wait_stream(cp_stream)
     return a2a_outputs[0] if len(a2a_inputs) == 1 else a2a_outputs
 
@@ -3806,6 +3974,12 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
         fp8_meta,
         cp_group,
         cp_stream,
+        heter = False,
+        ngroups = None,
+        seqlen_tot = None,
+        headnum_tot_kv = None,
+        seqlen_per_rank = None,
+        headnum_per_rank_kv = None,
     ):
         # pylint: disable=missing-function-docstring
         if softmax_scale is None:
@@ -3852,7 +4026,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
         batch_dim = qkv_format.index("b")
         seq_dim = qkv_format.index("s")
         assert (
-            q.shape[seq_dim] % 2 == 0 and k.shape[seq_dim] % 2 == 0
+            heter or (q.shape[seq_dim] % 2 == 0 and k.shape[seq_dim] % 2 == 0)
         ), "Sequence length per GPU needs to be divisible by 2!"
 
         qkv_dtype = q.dtype
@@ -3901,10 +4075,18 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
                 fused_attn_qkv_dtype = TE_DType[q.dtype]
                 fused_attn_backend = FusedAttnBackend["F16_arbitrary_seqlen"]
 
-        chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size, q.device, True)
-        q, k, v = flash_attn_a2a_communicate(
-            [q, k, v], chunk_ids_for_a2a, seq_dim, cp_size, cp_group, cp_stream, True
-        )
+        if not heter:
+            chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size, q.device, True)
+            q, k, v = flash_attn_a2a_communicate(
+                [q, k, v], chunk_ids_for_a2a, seq_dim, cp_size, cp_group, cp_stream, True
+            )
+        else:
+            headnum_tot_list = [headnum_tot_kv * ngroups, headnum_tot_kv, headnum_tot_kv]
+            headnum_per_rank_list = [headnum_per_rank_kv * ngroups, headnum_per_rank_kv, headnum_per_rank_kv]
+            q, k, v = flash_attn_a2a_communicate_heter(
+                [q, k, v], seq_dim, seqlen_tot, headnum_tot_list, \
+                seqlen_per_rank, headnum_per_rank_list, cp_size, cp_group, cp_stream, True
+            )
 
         if fp8 and not is_input_fp8 and not int(os.getenv("NVTE_FP8_DPA_BWD", "1")):
             q_f16, k_f16, v_f16 = q, k, v
@@ -3957,10 +4139,18 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             # [b*cp*s, np//cp, hn] -> [b, cp*s, np//cp, hn]
             out = out.view(batch_size, -1, *out.shape[-2:])
 
-        chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size, out.device, False)
-        out = flash_attn_a2a_communicate(
-            out, chunk_ids_for_a2a, seq_dim, cp_size, cp_group, cp_stream, False
-        )
+        if not heter:
+            chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size, out.device, False)
+            out = flash_attn_a2a_communicate(
+                out, chunk_ids_for_a2a, seq_dim, cp_size, cp_group, cp_stream, False
+            )
+        else:
+            headnum_tot_list = [headnum_tot_kv * ngroups]
+            headnum_per_rank_list = [headnum_per_rank_kv * ngroups]
+            out = flash_attn_a2a_communicate_heter(
+                out, seq_dim, seqlen_tot, headnum_tot_list, \
+                seqlen_per_rank, headnum_per_rank_list, cp_size, cp_group, cp_stream, False
+            )
 
         if use_fused_attention:
             if qkv_format == "bshd":
@@ -4037,6 +4227,12 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
         ctx.batch_size = batch_size
         ctx.cp_group = cp_group
         ctx.cp_stream = cp_stream
+        ctx.heter = heter
+        ctx.ngroups = ngroups
+        ctx.seqlen_tot = seqlen_tot
+        ctx.headnum_tot_kv = headnum_tot_kv
+        ctx.seqlen_per_rank = seqlen_per_rank
+        ctx.headnum_per_rank_kv = headnum_per_rank_kv
         ctx.dropout_p = dropout_p
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_kv = max_seqlen_kv
@@ -4118,10 +4314,18 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             out = out.view(ctx.batch_size, -1, *out.shape[-2:])
         dout = dout.view(*out.shape)
 
-        chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size, out.device, True)
-        out, dout = flash_attn_a2a_communicate(
-            [out, dout], chunk_ids_for_a2a, seq_dim, cp_size, ctx.cp_group, ctx.cp_stream, True
-        )
+        if not ctx.heter:
+            chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size, out.device, True)
+            out, dout = flash_attn_a2a_communicate(
+                [out, dout], chunk_ids_for_a2a, seq_dim, cp_size, ctx.cp_group, ctx.cp_stream, True
+            )
+        else:
+            headnum_tot_list = [ctx.headnum_tot_kv * ctx.ngroups] * 2
+            headnum_per_gpu_list = [ctx.headnum_per_rank_kv * ctx.ngroups] * 2
+            out, dout = flash_attn_a2a_communicate_heter(
+                [out, dout], seq_dim, ctx.seqlen_tot, headnum_tot_list, \
+                ctx.seqlen_per_rank, headnum_per_gpu_list, cp_size, ctx.cp_group, ctx.cp_stream, True
+            )
 
         flash_attn_bwd = None
         if not ctx.use_fused_attention:
@@ -4191,11 +4395,22 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             )
             dq, dk, dv = [x.view(ctx.batch_size, -1, *x.shape[-2:]) for x in [dq, dk, dv]]
 
-        chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size, q.device, False)
-        dq, dk, dv = flash_attn_a2a_communicate(
-            [dq, dk, dv], chunk_ids_for_a2a, seq_dim, cp_size, ctx.cp_group, ctx.cp_stream, False
-        )
-
+        if not ctx.heter:
+            chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size, q.device, False)
+            dq, dk, dv = flash_attn_a2a_communicate(
+                [dq, dk, dv], chunk_ids_for_a2a, seq_dim, cp_size, ctx.cp_group, ctx.cp_stream, False
+            )
+        else:
+            headnum_tot_list = [ctx.headnum_tot_kv * ctx.ngroups, ctx.headnum_tot_kv, ctx.headnum_tot_kv]
+            headnum_per_gpu_list = [
+                ctx.headnum_per_rank_kv * ctx.ngroups, 
+                ctx.headnum_per_rank_kv, 
+                ctx.headnum_per_rank_kv
+            ]
+            dq, dk, dv = flash_attn_a2a_communicate_heter(
+                [dq, dk, dv], seq_dim, ctx.seqlen_tot, headnum_tot_list, \
+                ctx.seqlen_per_rank, headnum_per_gpu_list, cp_size, ctx.cp_group, ctx.cp_stream, False
+            )
         if ctx.qkv_format == "bshd":
             dq, dk, dv = [x.view(ctx.batch_size, -1, *x.shape[-2:]) for x in [dq, dk, dv]]
         elif ctx.qkv_format == "sbhd":
@@ -4251,6 +4466,11 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
 
 
@@ -4280,6 +4500,11 @@ def attn_forward_func_with_cp(
     window_size=None,
     fp8=False,
     fp8_meta=None,
+    ngroups=None,
+    seqlen_tot=None,
+    headnum_tot_kv=None,
+    seqlen_per_gpu=None,
+    headnum_per_gpu_kv=None,
 ) -> torch.Tensor:
     """
     Attention implementation with context parallelism.
@@ -4365,6 +4590,9 @@ def attn_forward_func_with_cp(
         out = AttnFuncWithCPAndKVAllGather.apply(*args)
     elif cp_comm_type == "a2a":
         args += [window_size, fp8, fp8_meta, cp_group, cp_stream]
+        if ngroups is not None and seqlen_tot is not None and headnum_tot_kv is not None and \
+            seqlen_per_gpu is not None and headnum_per_gpu_kv is not None:
+            args += [True, ngroups, seqlen_tot, headnum_tot_kv, seqlen_per_gpu, headnum_per_gpu_kv]
         out = AttnFuncWithCPAndQKVOA2A.apply(*args)
     else:
         raise ValueError(f"Unsupported communication type: {cp_comm_type}!")
@@ -5236,9 +5464,13 @@ class FlashAttention(torch.nn.Module):
         cp_comm_type: str = "p2p",
         fp8: bool = False,
         fp8_meta: Optional[Dict[str, Any]] = None,
+        ngroups: Optional[int] = None,
+        seqlen_tot: Optional[int] = None,
+        headnum_tot_kv: Optional[int] = None,
+        seqlen_per_gpu: Optional[torch.Tensor] = None,
+        headnum_per_gpu_kv: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """flash-attn fprop"""
-
         assert all(
             x.dtype in [torch.float16, torch.bfloat16] or isinstance(x, Float8Tensor)
             for x in [query_layer, key_layer, value_layer]
@@ -5257,6 +5489,8 @@ class FlashAttention(torch.nn.Module):
             for group in cp_group:
                 cp_size *= get_distributed_world_size(group)
         context_parallel = cp_size > 1
+        heter = seqlen_tot is not None and headnum_tot_kv is not None and \
+            seqlen_per_gpu is not None and headnum_per_gpu_kv is not None
 
         qkv_format = "".join([i for i in qkv_layout.split("_")[0] if i.isalpha()])
 
@@ -5297,9 +5531,13 @@ class FlashAttention(torch.nn.Module):
         batch_size = query_layer.shape[0]
 
         if qkv_format in ["sbhd", "bshd"]:
-            max_seqlen_q, max_seqlen_kv = query_layer.shape[1], key_layer.shape[1]
-            max_seqlen_q *= cp_size
-            max_seqlen_kv *= cp_size
+            if not heter:
+                max_seqlen_q, max_seqlen_kv = query_layer.shape[1], key_layer.shape[1]
+                max_seqlen_q *= cp_size
+                max_seqlen_kv *= cp_size
+            else:
+                max_seqlen_q = seqlen_tot
+                max_seqlen_kv = seqlen_tot
 
             if "padding" in attn_mask_type:
                 assert not context_parallel, "Padding mask not supported with context parallelism!"
@@ -5389,6 +5627,11 @@ class FlashAttention(torch.nn.Module):
                     attn_mask_type=attn_mask_type,
                     deterministic=self.deterministic,
                     window_size=window_size,
+                    ngroups=ngroups,
+                    seqlen_tot=seqlen_tot,
+                    headnum_tot_kv=headnum_tot_kv,
+                    seqlen_per_gpu=seqlen_per_gpu,
+                    headnum_per_gpu_kv=headnum_per_gpu_kv,
                 )
         else:
 
@@ -7395,6 +7638,12 @@ class DotProductAttention(TransformerEngineBaseModule):
                   "a2a+p2p": hierarchical CP implementation. First applying a2a to QKV
                   across each CP sub-group (e.g., via NVLink), then exchanging KV with
                   p2p between sub-groups (e.g., via IBLink).
+    seqlen_tot : Optional[int], default = None
+                the sum of sequence length across different cp ranks, used in heterogeneous Ulysses.
+    seqlen_per_gpu : Optional[torch.Tensor], default = None
+                    the sequence length for each cp rank in heterogeneous Ulysses.
+    headnum_per_gpu_kv : Optional[torch.Tensor], default = None
+                     the number of attention heads in k and v for each cp rank in heterogeneous Ulysses.
     """
 
     def __init__(
@@ -7417,6 +7666,9 @@ class DotProductAttention(TransformerEngineBaseModule):
         cp_stream: torch.cuda.Stream = None,
         cp_comm_type: str = "p2p",
         softmax_scale: Optional[float] = None,
+        seqlen_tot: Optional[int] = None,
+        seqlen_per_gpu: Optional[torch.Tensor] = None,
+        headnum_per_gpu_kv: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
 
@@ -7444,6 +7696,9 @@ class DotProductAttention(TransformerEngineBaseModule):
         self.cp_global_ranks = cp_global_ranks
         self.cp_stream = cp_stream
         self.cp_comm_type = cp_comm_type
+        self.seqlen_tot = seqlen_tot
+        self.seqlen_per_gpu = seqlen_per_gpu
+        self.headnum_per_gpu_kv = headnum_per_gpu_kv
 
         self.hidden_size_per_attention_head_k = (
             kv_channels if isinstance(kv_channels, int) else kv_channels[0]
@@ -7840,6 +8095,9 @@ class DotProductAttention(TransformerEngineBaseModule):
             allow_non_contiguous=True,
         ) as query_layer:
 
+            heter = self.seqlen_tot is not None and \
+                self.seqlen_per_gpu is not None and self.headnum_per_gpu_kv is not None
+
             if self.fp8:
                 if self.fp8_meta["recipe"].fp8_mha:
                     if not self.fp8_meta["recipe"].fp8_dpa:
@@ -8013,6 +8271,9 @@ class DotProductAttention(TransformerEngineBaseModule):
                     batch_size = query_layer.shape[0]
                 max_seqlen_q *= cp_size
                 max_seqlen_kv *= cp_size
+                if heter:
+                    max_seqlen_q = self.seqlen_tot
+                    max_seqlen_kv = self.seqlen_tot
                 if cu_seqlens_q is not None:
                     seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
                     assert all(
@@ -8203,6 +8464,11 @@ class DotProductAttention(TransformerEngineBaseModule):
                     max_seqlen_kv=max_seqlen_kv,
                     fp8=self.fp8 and self.fp8_meta["recipe"].fp8_dpa,
                     fp8_meta=self.fp8_meta,
+                    ngroups=self.num_attention_heads//self.num_gqa_groups,
+                    seqlen_tot=self.seqlen_tot,
+                    headnum_tot_kv=self.num_gqa_groups,
+                    seqlen_per_gpu=self.seqlen_per_gpu,
+                    headnum_per_gpu_kv=self.headnum_per_gpu_kv,
                 )
 
             if use_fused_attention:
