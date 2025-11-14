@@ -5764,10 +5764,16 @@ class FlashAttention(torch.nn.Module):
                     .contiguous(),
                 )
             else:
-                output = output.view(batch_size, max_seqlen_q // cp_size, -1).transpose(0, 1)
+                if not heter:
+                    output = output.view(batch_size, max_seqlen_q // cp_size, -1).transpose(0, 1)
+                else:
+                    output = output.view(batch_size, -1, output.shape[1] * output.shape[2]).transpose(0, 1)
         elif qkv_format == "bshd":
             # (bs)hd -> bs(hd)
-            output = output.reshape(batch_size, max_seqlen_q // cp_size, -1)
+            if not heter:
+                output = output.reshape(batch_size, max_seqlen_q // cp_size, -1)
+            else:
+                output = output.reshape(batch_size, -1, output.shape[1] * output.shape[2])
         elif qkv_format == "thd":
             # thd -> t(hd)
             output = output.reshape(output.shape[0], -1)
