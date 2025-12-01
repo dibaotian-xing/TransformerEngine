@@ -39,3 +39,4 @@ downloads/
 .pytest_cache/
 compile_commands.json
 .nfs
+*.pt

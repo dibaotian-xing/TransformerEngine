@@ -273,6 +273,7 @@ def test_heter_ulysses():
     k_heter_grad = pad_all_gather_with_autograd(k_heter.grad, dim=1)
     v_heter_grad = pad_all_gather_with_autograd(v_heter.grad, dim=1)
 
+    #(lj) NOTE: due to the non-deterministic of flash attn backward, we can't use torch.equal() for bwd result comparison.
     q_diff = torch.max(torch.abs(q_homo_grad - q_heter_grad) / (torch.abs(q_heter_grad) + 1e-13))
     k_diff = torch.max(torch.abs(k_homo_grad - k_heter_grad) / (torch.abs(k_heter_grad) + 1e-13))
     v_diff = torch.max(torch.abs(v_homo_grad - v_heter_grad) / (torch.abs(v_heter_grad) + 1e-13))
