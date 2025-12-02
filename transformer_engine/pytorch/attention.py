@@ -1587,8 +1587,8 @@ def reorder_seq_chunks_for_heter(
     before_attn,
 ):
     "Reorder sequence chunk for heterogeneous Ulysses"
-    import time
-    start_time = time.time()
+    # import time
+    # start_time = time.time()
     device = x.device
     seqlen_per_gpu = seqlen_per_gpu.to(device=device)
     headnum_per_gpu = headnum_per_gpu.to(device=device)
@@ -1608,8 +1608,7 @@ def reorder_seq_chunks_for_heter(
         # [seqlen_i, np, b, hn] -> [b, seqlen_i, np, hn]
         # or [seqlen_i, np, b, hn] -> [seqlen_i, b, np, hn]
         result = result.movedim(1,-2).movedim(0, seq_dim)
-    torch.cuda.synchronize()
-    print(f"time except contiguous: {time.time() - start_time}")
+    # print(f"time except contiguous: {time.time() - start_time}")
     return result.contiguous()
 
 
@@ -1625,10 +1624,10 @@ def flash_attn_a2a_communicate(
     """A2A communication for context parallelism."""
     a2a_inputs = [a2a_inputs] if not isinstance(a2a_inputs, list) else a2a_inputs
     a2a_outputs, a2a_reqs = [None] * len(a2a_inputs), [None] * len(a2a_inputs)
-    import time
-    start_time = time.time()
-    reorder_total_time = 0
-    reshape_total_time = 0
+    # import time
+    # start_time = time.time()
+    # reorder_total_time = 0
+    # reshape_total_time = 0
     if before_attn:
         for i in range(len(a2a_inputs) + 2):
             if 0 < i < len(a2a_inputs) + 1:
@@ -1641,24 +1640,24 @@ def flash_attn_a2a_communicate(
                     a2a_reqs[i - 2].wait()
                     x = a2a_outputs[i - 2]
                     # reorder the sequence chunks
-                    reorder_start_time = time.time() 
+                    # reorder_start_time = time.time() 
                     x = reorder_seq_chunks_for_a2a(
                         x, chunk_ids_for_a2a, seq_dim, cp_size, before_attn
                     )
-                    reorder_total_time += time.time() - reorder_start_time
+                    # reorder_total_time += time.time() - reorder_start_time
                     # [b, cp*2, s//2, np//cp, hn] -> [b, cp*s, np//cp, hn]
                     # or [cp*2, s//2, b, np//cp, hn] -> [cp*s, b, np//cp, hn]
                     a2a_outputs[i - 2] = x.view(*x.shape[:seq_dim], -1, *x.shape[(seq_dim + 2) :])
             if i < len(a2a_inputs):
                 x = a2a_inputs[i]
-                reshape_start_time = time.time()
+                # reshape_start_time = time.time()
                 # [b, s, np, hn] -> [b, s, cp, np//cp, hn]
                 # or [s, b, np, hn] -> [s, b, cp, np//cp, hn]
                 x = x.view(*x.shape[:-2], cp_size, x.shape[-2] // cp_size, x.shape[-1])
                 # [b, s, cp, np//cp, hn] -> [cp, b, s, np//cp, hn]
                 # or [s, b, cp, np//cp, hn] -> [cp, s, b, np//cp, hn]
                 a2a_inputs[i] = x.movedim(-3, 0).contiguous()
-                reshape_total_time += time.time() - reshape_start_time
+                # reshape_total_time += time.time() - reshape_start_time
     else:
         for i in range(len(a2a_inputs) + 2):
             if 0 < i < len(a2a_inputs) + 1:
@@ -1686,10 +1685,10 @@ def flash_attn_a2a_communicate(
                     # or [2, s//2, b, cp, np//cp, hn] -> [s*b, np, hn]
                     a2a_outputs[i - 2] = x.view(-1, x.shape[-3] * x.shape[-2], x.shape[-1])
     torch.cuda.current_stream().wait_stream(cp_stream)
-    end_time = time.time()
-    print(f'homo total a2a time: {end_time - start_time}')
-    print(f"homo reorder total time: {reorder_total_time}")
-    print(f"homo reshape total time: {reshape_total_time}")
+    # end_time = time.time()
+    # print(f'homo total a2a time: {end_time - start_time}')
+    # print(f"homo reorder total time: {reorder_total_time}")
+    # print(f"homo reshape total time: {reshape_total_time}")
     return a2a_outputs[0] if len(a2a_inputs) == 1 else a2a_outputs
 
 
@@ -1711,10 +1710,10 @@ def flash_attn_a2a_communicate_heter(
     assert len(a2a_inputs) == len(headnum_per_gpu)
     a2a_outputs, a2a_reqs = [None] * len(a2a_inputs), [None] * len(a2a_inputs)
     cp_rank = torch.distributed.get_rank(cp_group)
-    import time
-    start_time = time.time()
-    reorder_total_time = 0
-    reshape_total_time = 0
+    # import time
+    # start_time = time.time()
+    # reorder_total_time = 0
+    # reshape_total_time = 0
     if before_attn:
         # a2a_inputs: [b, s_ranki, np, hn] or [s_ranki, b, np, hn]
         # a2a_outputs: [b, s_tot, np_i, hn] or [s_tot, b, np_i, hn]
@@ -1743,7 +1742,7 @@ def flash_attn_a2a_communicate_heter(
             if i > 1:
                 with torch.cuda.stream(cp_stream):
                     a2a_reqs[i - 2].wait()
-                    reorder_start_time = time.time()
+                    # reorder_start_time = time.time()
                     x = a2a_outputs[i - 2]
                     # reorder the sequence chunks
                     x = reorder_seq_chunks_for_heter(
@@ -1751,10 +1750,10 @@ def flash_attn_a2a_communicate_heter(
                         int(seqlen_per_gpu[cp_rank].item()), int(headnum_per_gpu[i - 2][cp_rank].item()),\
                         seq_dim, reorder_index=reorder_index_list[i - 2], before_attn=before_attn
                     )
-                    reorder_total_time += time.time() - reorder_start_time
+                    # reorder_total_time += time.time() - reorder_start_time
                     a2a_outputs[i - 2] = x
             if i < len(a2a_inputs):
-                reshape_start_time = time.time()
+                # reshape_start_time = time.time()
                 x = a2a_inputs[i]
                 # [b, s_ranki, np, hn] -> [np, s_ranki, b, hn]
                 # or [s_ranki, b, np, hn] -> [np, s_ranki, b, hn]
@@ -1762,7 +1761,7 @@ def flash_attn_a2a_communicate_heter(
                 # [np, s_ranki, b, hn] -> [np*s_ranki, b, hn]
                 x = x.view(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])
                 a2a_inputs[i] = x
-                reshape_total_time += time.time() - reshape_start_time
+                # reshape_total_time += time.time() - reshape_start_time
     else:
         # a2a_inputs: [b, s_tot, np_i, hn] or [s_tot, b, np_i, hn]
         # a2a_outputs: [b*s_ranki, np, hn] or [s_ranki*b, np, hn]
@@ -1807,10 +1806,10 @@ def flash_attn_a2a_communicate_heter(
                     )
                     a2a_outputs[i - 2] = x.view(x.shape[0] * x.shape[1],*x.shape[-2:])
     torch.cuda.current_stream().wait_stream(cp_stream)
-    end_time = time.time()
-    print(f'heter total a2a time: {end_time - start_time}')
-    print(f"heter reorder total time: {reorder_total_time}")
-    print(f"heter reshape total time: {reshape_total_time}")
+    # end_time = time.time()
+    # print(f'heter total a2a time: {end_time - start_time}')
+    # print(f"heter reorder total time: {reorder_total_time}")
+    # print(f"heter reshape total time: {reshape_total_time}")
     return a2a_outputs[0] if len(a2a_inputs) == 1 else a2a_outputs
 
 
@@ -3988,6 +3987,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
         reorder_index_before_attn_list = None,
         reorder_index_after_attn_list = None,
     ):
+        # print(f"{reorder_index_before_attn_list=}, {reorder_index_after_attn_list=}")
         # pylint: disable=missing-function-docstring
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -4499,6 +4499,8 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             dq,
             dk,
             dv,
+            None,
+            None,
             None,
             None,
             None,
@@ -7842,8 +7844,10 @@ class DotProductAttention(TransformerEngineBaseModule):
             for group in self.cp_group:
                 cp_size *= get_distributed_world_size(group)
 
+        my_cp_rank = torch.distributed.get_rank(self.cp_group)
+
         for headnum_per_gpu in headnum_per_gpu_list:
-            headnum_this_rank = int(headnum_per_gpu[cp_rank].item())
+            headnum_this_rank = int(headnum_per_gpu[my_cp_rank].item())
             presum = torch.cumsum(seqlen_per_gpu, dim=0) - seqlen_per_gpu
             indices_per_cp = []
             head_offsets = torch.arange(headnum_this_rank, device=device, dtype=torch.long).unsqueeze(1)
@@ -7857,7 +7861,7 @@ class DotProductAttention(TransformerEngineBaseModule):
             self.reorder_idx_before_attn_list.append(indices_per_head.reshape(-1).to(dtype=torch.long))
 
         for headnum_per_gpu in headnum_per_gpu_list:
-            seqlen_this_rank = int(seqlen_per_gpu[cp_rank].item())
+            seqlen_this_rank = int(seqlen_per_gpu[my_cp_rank].item())
             presum = torch.cumsum(headnum_per_gpu, dim=0) - headnum_per_gpu
             indices_per_cp = []
             seq_offsets = torch.arange(seqlen_this_rank, device=device, dtype=torch.long).unsqueeze(1)
