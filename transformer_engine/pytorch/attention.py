@@ -1710,10 +1710,6 @@ def flash_attn_a2a_communicate_heter(
     assert len(a2a_inputs) == len(headnum_per_gpu)
     a2a_outputs, a2a_reqs = [None] * len(a2a_inputs), [None] * len(a2a_inputs)
     cp_rank = torch.distributed.get_rank(cp_group)
-    # import time
-    # start_time = time.time()
-    # reorder_total_time = 0
-    # reshape_total_time = 0
     if before_attn:
         # a2a_inputs: [b, s_ranki, np, hn] or [s_ranki, b, np, hn]
         # a2a_outputs: [b, s_tot, np_i, hn] or [s_tot, b, np_i, hn]
@@ -1753,7 +1749,6 @@ def flash_attn_a2a_communicate_heter(
                     # reorder_total_time += time.time() - reorder_start_time
                     a2a_outputs[i - 2] = x
             if i < len(a2a_inputs):
-                # reshape_start_time = time.time()
                 x = a2a_inputs[i]
                 # [b, s_ranki, np, hn] -> [np, s_ranki, b, hn]
                 # or [s_ranki, b, np, hn] -> [np, s_ranki, b, hn]
@@ -1761,7 +1756,6 @@ def flash_attn_a2a_communicate_heter(
                 # [np, s_ranki, b, hn] -> [np*s_ranki, b, hn]
                 x = x.view(x.shape[0] * x.shape[1], x.shape[2], x.shape[3])
                 a2a_inputs[i] = x
-                # reshape_total_time += time.time() - reshape_start_time
     else:
         # a2a_inputs: [b, s_tot, np_i, hn] or [s_tot, b, np_i, hn]
         # a2a_outputs: [b*s_ranki, np, hn] or [s_ranki*b, np, hn]
@@ -1806,10 +1800,6 @@ def flash_attn_a2a_communicate_heter(
                     )
                     a2a_outputs[i - 2] = x.view(x.shape[0] * x.shape[1],*x.shape[-2:])
     torch.cuda.current_stream().wait_stream(cp_stream)
-    # end_time = time.time()
-    # print(f'heter total a2a time: {end_time - start_time}')
-    # print(f"heter reorder total time: {reorder_total_time}")
-    # print(f"heter reshape total time: {reshape_total_time}")
     return a2a_outputs[0] if len(a2a_inputs) == 1 else a2a_outputs
 
 
@@ -4082,15 +4072,11 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
                 fused_attn_qkv_dtype = TE_DType[q.dtype]
                 fused_attn_backend = FusedAttnBackend["F16_arbitrary_seqlen"]
 
-        # import time
-        # start_time = time.time()
         if not heter:
             chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size, q.device, True)
             q, k, v = flash_attn_a2a_communicate(
                 [q, k, v], chunk_ids_for_a2a, seq_dim, cp_size, cp_group, cp_stream, True
             )
-            # end_time = time.time()
-            # print(f"homo forward a2a time before attn: {end_time - start_time}")
         else:
             headnum_tot_list = [headnum_tot_kv * ngroups, headnum_tot_kv, headnum_tot_kv]
             headnum_per_rank_list = [headnum_per_rank_kv * ngroups, headnum_per_rank_kv, headnum_per_rank_kv]
@@ -4104,8 +4090,6 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
                 seqlen_per_rank, headnum_per_rank_list, reorder_index_list, cp_group, \
                 cp_stream, True
             )
-            # end_time = time.time()
-            # print(f"heter forward a2a time before attn: {end_time - start_time}")
 
         if fp8 and not is_input_fp8 and not int(os.getenv("NVTE_FP8_DPA_BWD", "1")):
             q_f16, k_f16, v_f16 = q, k, v
@@ -4140,7 +4124,6 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             )
         else:
             # [b, cp*s, np//cp, hn] -> [b*cp*s, np//cp, hn]
-            # start_time = time.time()
             q, k, v = [x.view(-1, *x.shape[-2:]) for x in [q, k, v]]
             fa_outputs = flash_attn_fwd(
                 q,
@@ -4158,17 +4141,12 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             aux_ctx_tensors = [softmax_lse, rng_state]
             # [b*cp*s, np//cp, hn] -> [b, cp*s, np//cp, hn]
             out = out.view(batch_size, -1, *out.shape[-2:])
-            # end_time = time.time()
-            # print(f"flash attn fwd time: {end_time - start_time}")
 
-        # start_time = time.time()
         if not heter:
             chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size, out.device, False)
             out = flash_attn_a2a_communicate(
                 out, chunk_ids_for_a2a, seq_dim, cp_size, cp_group, cp_stream, False
             )
-            # end_time = time.time()
-            # print(f"homo forward a2a time after attn: {end_time - start_time}")
         else:
             headnum_tot_list = [headnum_tot_kv * ngroups]
             headnum_per_rank_list = [headnum_per_rank_kv * ngroups]
@@ -4178,8 +4156,6 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
                 seqlen_per_rank, headnum_per_rank_list, reorder_index_list, \
                 cp_group, cp_stream, False
             )
-            # end_time = time.time()
-            # print(f"heter forward a2a time after attn: {end_time - start_time}")
 
         if use_fused_attention:
             if qkv_format == "bshd":
