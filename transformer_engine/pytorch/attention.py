@@ -3977,7 +3977,6 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
         reorder_index_before_attn_list = None,
         reorder_index_after_attn_list = None,
     ):
-        # print(f"{reorder_index_before_attn_list=}, {reorder_index_after_attn_list=}")
         # pylint: disable=missing-function-docstring
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -4321,15 +4320,11 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             out = out.view(ctx.batch_size, -1, *out.shape[-2:])
         dout = dout.view(*out.shape)
 
-        # import time
-        # start_time = time.time()
         if not ctx.heter:
             chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size, out.device, True)
             out, dout = flash_attn_a2a_communicate(
                 [out, dout], chunk_ids_for_a2a, seq_dim, cp_size, ctx.cp_group, ctx.cp_stream, True
             )
-            # end_time = time.time()
-            # print(f"homo backward a2a time before attn: {end_time - start_time}")
         else:
             headnum_tot_list = [ctx.headnum_tot_kv * ctx.ngroups] * 2
             headnum_per_gpu_list = [ctx.headnum_per_rank_kv * ctx.ngroups] * 2
@@ -4339,8 +4334,6 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
                 ctx.seqlen_per_rank, headnum_per_gpu_list, reorder_index_list, \
                 ctx.cp_group, ctx.cp_stream, True
             )
-            # end_time = time.time()
-            # print(f"heter backward a2a time before attn: {end_time - start_time}")
 
         flash_attn_bwd = None
         if not ctx.use_fused_attention:
@@ -4386,7 +4379,6 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
                 **fp8_meta_kwargs,
             )
         else:
-            # start_time = time.time()
             softmax_lse, rng_state = aux_ctx_tensors
             out, dout = [x.view(-1, *x.shape[-2:]) for x in [out, dout]]
             dq, dk, dv = [torch.empty_like(x) for x in [q, k, v]]
@@ -4410,17 +4402,12 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
                 **fa_backward_kwargs,
             )
             dq, dk, dv = [x.view(ctx.batch_size, -1, *x.shape[-2:]) for x in [dq, dk, dv]]
-            # end_time = time.time()
-            # print(f"flash attn bwd time: {end_time - start_time}")
 
-        # start_time = time.time()
         if not ctx.heter:
             chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering(cp_size, q.device, False)
             dq, dk, dv = flash_attn_a2a_communicate(
                 [dq, dk, dv], chunk_ids_for_a2a, seq_dim, cp_size, ctx.cp_group, ctx.cp_stream, False
             )
-            # end_time = time.time()
-            # print(f"homo backward a2a time after attn: {end_time - start_time}")
         else:
             headnum_tot_list = [ctx.headnum_tot_kv * ctx.ngroups, ctx.headnum_tot_kv, ctx.headnum_tot_kv]
             headnum_per_gpu_list = [
@@ -4438,8 +4425,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
                 ctx.seqlen_per_rank, headnum_per_gpu_list, reorder_index_list, \
                 ctx.cp_group, ctx.cp_stream, False
             )
-            # end_time = time.time()
-            # print(f"heter backward a2a time after attn: {end_time - start_time}")
+
         if ctx.qkv_format == "bshd":
             dq, dk, dv = [x.view(ctx.batch_size, -1, *x.shape[-2:]) for x in [dq, dk, dv]]
         elif ctx.qkv_format == "sbhd":
