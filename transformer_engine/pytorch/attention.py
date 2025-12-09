@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import warnings
 import logging
 import functools
+import json
 
 from dataclasses import dataclass, fields
 import numpy as np
@@ -5493,6 +5494,8 @@ class FlashAttention(torch.nn.Module):
         headnum_per_gpu_kv: Optional[torch.Tensor] = None,
         reorder_index_before_attn_list: Optional[List[torch.Tensor]] = None,
         reorder_index_after_attn_list: Optional[List[torch.Tensor]] = None,
+        heter_ulysses_profile_config_dict: Optional[str] = None,
+        heter_ulysses_profile_config_key: Optional[str] = None,
     ) -> torch.Tensor:
         """flash-attn fprop"""
         assert all(
@@ -5766,6 +5769,12 @@ class FlashAttention(torch.nn.Module):
                             dtype=activation_dtype,
                         )
                 else:
+                    profile_heter_ulysses = heter_ulysses_profile_config_dict is not None \
+                        and heter_ulysses_profile_config_key is not None
+                    if profile_heter_ulysses:
+                        import time
+                        torch.cuda.synchronize()
+                        start_time = time.time()
                     output = func(
                         query_layer,
                         key_layer,
@@ -5776,6 +5785,10 @@ class FlashAttention(torch.nn.Module):
                         causal="causal" in attn_mask_type,
                         **fa_optional_forward_kwargs,
                     )
+                    if profile_heter_ulysses:
+                        torch.cuda.synchronize()
+                        time_interval = (time.time() - start_time) * 1000
+                        heter_ulysses_profile_config_dict[heter_ulysses_profile_config_key] = time_interval
 
         if qkv_format in ["sbhd", "bshd"] and "padding" in attn_mask_type:
             output = UnpackTensor.apply(indices_q, batch_size * max_seqlen_q, output)
@@ -7701,6 +7714,9 @@ class DotProductAttention(TransformerEngineBaseModule):
         seqlen_tot: Optional[int] = None,
         seqlen_per_gpu: Optional[torch.Tensor] = None,
         headnum_per_gpu_kv: Optional[torch.Tensor] = None,
+        profile_heter_ulysses: bool = False,
+        gpu_type_id: Optional[int] = None,
+        heter_ulysses_model_name: Optional[str] = None,
     ) -> None:
         super().__init__()
 
@@ -7835,6 +7851,16 @@ class DotProductAttention(TransformerEngineBaseModule):
                 indices_per_cp.append(indices_cp)
             indices_per_token = torch.cat(indices_per_cp, dim=1)
             self.reorder_idx_after_attn_list.append(indices_per_token.reshape(-1).to(dtype=torch.long))
+
+        self.profile_heter_ulysses = profile_heter_ulysses
+        self.gpu_type_id = gpu_type_id
+        self.hu_config_dict = None
+        if profile_heter_ulysses:
+            self.heter_ulysses_config_path = f"examples/profile/models/configs/" \
+                                        f"time_{heter_ulysses_model_name}_seqlen{self.seqlen_tot}.json"
+            self.hu_config_dict = json.load(open(self.heter_ulysses_config_path, "r", encoding="utf-8")) \
+                if os.path.exists(self.heter_ulysses_config_path) else {}
+            self.profile_iter = 0
 
         self.flash_attention = FlashAttention(
             softmax_scale,
@@ -8172,6 +8198,13 @@ class DotProductAttention(TransformerEngineBaseModule):
 
             heter = self.seqlen_tot is not None and \
                 self.seqlen_per_gpu is not None and self.headnum_per_gpu_kv is not None
+
+            heter_ulysses_profile_config_key = None
+            if self.profile_heter_ulysses:
+                bsz = query_layer.shape[1]
+                heter_ulysses_profile_config_key = f'attn_time_gpu_type{self.gpu_type_id}' \
+                                                f'_gqa_group{self.num_gqa_groups}_iter{self.profile_iter}_bsz{bsz}'
+                self.profile_iter += 1
 
             if self.fp8:
                 if self.fp8_meta["recipe"].fp8_mha:
@@ -8546,6 +8579,8 @@ class DotProductAttention(TransformerEngineBaseModule):
                     headnum_per_gpu_kv=self.headnum_per_gpu_kv,
                     reorder_index_before_attn_list=self.reorder_idx_before_attn_list,
                     reorder_index_after_attn_list=self.reorder_idx_after_attn_list,
+                    heter_ulysses_profile_config_dict=self.hu_config_dict,
+                    heter_ulysses_profile_config_key=heter_ulysses_profile_config_key,
                 )
 
             if use_fused_attention:
