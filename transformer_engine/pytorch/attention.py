@@ -7717,6 +7717,7 @@ class DotProductAttention(TransformerEngineBaseModule):
         profile_heter_ulysses: bool = False,
         gpu_type_id: Optional[int] = None,
         heter_ulysses_model_name: Optional[str] = None,
+        heter_ulysses_cluster_type: Optional[str] = None,
     ) -> None:
         super().__init__()
 
@@ -7857,7 +7858,7 @@ class DotProductAttention(TransformerEngineBaseModule):
         self.hu_config_dict = None
         if profile_heter_ulysses:
             self.heter_ulysses_config_path = f"examples/profile/models/configs/" \
-                                        f"time_{heter_ulysses_model_name}_seqlen{self.seqlen_tot}.json"
+                                        f"profile_time_{heter_ulysses_model_name}_{heter_ulysses_cluster_type}.json"
             self.hu_config_dict = json.load(open(self.heter_ulysses_config_path, "r", encoding="utf-8")) \
                 if os.path.exists(self.heter_ulysses_config_path) else {}
             self.profile_iter = 0
@@ -8202,7 +8203,7 @@ class DotProductAttention(TransformerEngineBaseModule):
             heter_ulysses_profile_config_key = None
             if self.profile_heter_ulysses:
                 bsz = query_layer.shape[1]
-                heter_ulysses_profile_config_key = f'attn_time_gpu_type{self.gpu_type_id}' \
+                heter_ulysses_profile_config_key = f'attn_time_gpu_type{self.gpu_type_id}_seqlen{self.seqlen_tot}' \
                                                 f'_gqa_group{self.num_gqa_groups}_iter{self.profile_iter}_bsz{bsz}'
                 self.profile_iter += 1
 
