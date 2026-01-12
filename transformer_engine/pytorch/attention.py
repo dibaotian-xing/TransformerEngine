@@ -7714,6 +7714,12 @@ class DotProductAttention(TransformerEngineBaseModule):
                     the sequence length for each cp rank in heterogeneous Ulysses.
     headnum_per_gpu_kv : Optional[torch.Tensor], default = None
                      the number of attention heads in k and v for each cp rank in heterogeneous Ulysses.
+    profile_heter_ulysses : bool, default = False
+                    whether to profile the train process to get the data for search algorithm.
+    gpu_type_id : Optional[int], default = None
+                    the index of gpu type, used in heter ulysses profiling.
+    heter_ulysses_model_name : Optional[str], default = None
+                    the name of the model, used in heter ulysses profiling.
     """
 
     def __init__(
@@ -7742,7 +7748,6 @@ class DotProductAttention(TransformerEngineBaseModule):
         profile_heter_ulysses: bool = False,
         gpu_type_id: Optional[int] = None,
         heter_ulysses_model_name: Optional[str] = None,
-        heter_ulysses_cluster_type: Optional[str] = None,
     ) -> None:
         super().__init__()
 
@@ -7884,7 +7889,7 @@ class DotProductAttention(TransformerEngineBaseModule):
         self.hu_mem_config_dict = None
         if profile_heter_ulysses:
             self.heter_ulysses_time_config_path = f"examples/profile/models/configs/" \
-                                        f"profile_time_{heter_ulysses_model_name}_{heter_ulysses_cluster_type}.json"
+                                        f"profile_time_{heter_ulysses_model_name}_gputype{gpu_type_id}.json"
             self.hu_time_config_dict = json.load(open(self.heter_ulysses_time_config_path, "r", encoding="utf-8")) \
                 if os.path.exists(self.heter_ulysses_time_config_path) else {}
             self.heter_ulysses_mem_config_path = \
