@@ -5438,12 +5438,11 @@ def get_peak_memory(device):
     return max_mem, curr_mem
 
 
-def profile_memory(should_profile_memory, profile_mem_dict, mem_dict_key, stage=""):
-    if should_profile_memory:
-        local_rank = torch.distributed.get_rank()
+def profile_memory(profile_mem_dict, mem_dict_key, stage=""):
+    local_rank = torch.distributed.get_rank()
 
-        _, cur_mem = get_peak_memory(local_rank)
-        profile_mem_dict[f"{mem_dict_key} {stage}"] = cur_mem
+    _, cur_mem = get_peak_memory(local_rank)
+    profile_mem_dict[f"{mem_dict_key} {stage}"] = cur_mem
 
 
 class FlashAttention(torch.nn.Module):
@@ -5512,7 +5511,6 @@ class FlashAttention(torch.nn.Module):
         heter_ulysses_time_profile_config_key: Optional[str] = None,
         heter_ulysses_mem_profile_config_dict: Optional[Dict[str, float]] = None,
         heter_ulysses_mem_profile_config_key: Optional[str] = None,
-        should_profile_memory: Optional[bool] = False,
     ) -> torch.Tensor:
         """flash-attn fprop"""
         assert all(
@@ -5786,15 +5784,17 @@ class FlashAttention(torch.nn.Module):
                             dtype=activation_dtype,
                         )
                 else:
-                    profile_heter_ulysses = heter_ulysses_time_profile_config_dict is not None \
-                        and heter_ulysses_time_profile_config_key is not None and \
-                        heter_ulysses_mem_profile_config_dict is not None and \
-                        heter_ulysses_mem_profile_config_key is not None and should_profile_memory is not None
-                    if profile_heter_ulysses:
+                    profile_heter_ulysses_time = heter_ulysses_time_profile_config_dict is not None \
+                        and heter_ulysses_time_profile_config_key is not None
+                    profile_heter_ulysses_mem = heter_ulysses_mem_profile_config_dict is not None and \
+                        heter_ulysses_mem_profile_config_key is not None
+                    if profile_heter_ulysses_time:
                         import time
                         torch.cuda.synchronize()
                         start_time = time.time()
-                        profile_memory(should_profile_memory, heter_ulysses_mem_profile_config_dict, 
+                    if profile_heter_ulysses_mem:
+                        torch.cuda.synchronize()
+                        profile_memory(heter_ulysses_mem_profile_config_dict, 
                                        heter_ulysses_mem_profile_config_key, "Before CoreAttention")
                     
                     output = func(
@@ -5808,11 +5808,13 @@ class FlashAttention(torch.nn.Module):
                         **fa_optional_forward_kwargs,
                     )
                     
-                    if profile_heter_ulysses:
+                    if profile_heter_ulysses_time:
                         torch.cuda.synchronize()
                         time_interval = (time.time() - start_time) * 1000
                         heter_ulysses_time_profile_config_dict[heter_ulysses_time_profile_config_key] = time_interval
-                        profile_memory(should_profile_memory, heter_ulysses_mem_profile_config_dict, 
+                    if profile_heter_ulysses_mem:
+                        torch.cuda.synchronize()
+                        profile_memory(heter_ulysses_mem_profile_config_dict, 
                                        heter_ulysses_mem_profile_config_key, "After CoreAttention")
 
         if qkv_format in ["sbhd", "bshd"] and "padding" in attn_mask_type:
@@ -7714,8 +7716,10 @@ class DotProductAttention(TransformerEngineBaseModule):
                     the sequence length for each cp rank in heterogeneous Ulysses.
     headnum_per_gpu_kv : Optional[torch.Tensor], default = None
                      the number of attention heads in k and v for each cp rank in heterogeneous Ulysses.
-    profile_heter_ulysses : bool, default = False
-                    whether to profile the train process to get the data for search algorithm.
+    profile_heter_ulysses : str, default = 'none'
+                    choices = ['none', 'time', 'memory']
+                    none means no profiling, time means profiling time, memory means profiling memory.
+                    the profiling data will be used for search algorithm.
     gpu_type_id : Optional[int], default = None
                     the index of gpu type, used in heter ulysses profiling.
     heter_ulysses_model_name : Optional[str], default = None
@@ -7745,7 +7749,7 @@ class DotProductAttention(TransformerEngineBaseModule):
         seqlen_tot: Optional[int] = None,
         seqlen_per_gpu: Optional[torch.Tensor] = None,
         headnum_per_gpu_kv: Optional[torch.Tensor] = None,
-        profile_heter_ulysses: bool = False,
+        profile_heter_ulysses: str = 'none',
         gpu_type_id: Optional[int] = None,
         heter_ulysses_model_name: Optional[str] = None,
     ) -> None:
@@ -7887,15 +7891,18 @@ class DotProductAttention(TransformerEngineBaseModule):
         self.gpu_type_id = gpu_type_id
         self.hu_time_config_dict = None
         self.hu_mem_config_dict = None
-        if profile_heter_ulysses:
-            self.heter_ulysses_time_config_path = f"examples/profile/models/configs/" \
-                                        f"profile_time_{heter_ulysses_model_name}_gputype{gpu_type_id}.json"
-            self.hu_time_config_dict = json.load(open(self.heter_ulysses_time_config_path, "r", encoding="utf-8")) \
-                if os.path.exists(self.heter_ulysses_time_config_path) else {}
-            self.heter_ulysses_mem_config_path = \
-                f"examples/profile/models/configs/profile_memory_{heter_ulysses_model_name}.json"
-            self.hu_mem_config_dict = json.load(open(self.heter_ulysses_mem_config_path, "r", encoding="utf-8")) \
-                if os.path.exists(self.heter_ulysses_mem_config_path) else {}
+        if profile_heter_ulysses != 'none':
+            if profile_heter_ulysses == 'time':
+                self.heter_ulysses_time_config_path = f"examples/profile/models/configs/" \
+                                            f"profile_time_{heter_ulysses_model_name}_gputype{gpu_type_id}.json"
+                self.hu_time_config_dict = \
+                    json.load(open(self.heter_ulysses_time_config_path, "r", encoding="utf-8")) \
+                    if os.path.exists(self.heter_ulysses_time_config_path) else {}
+            if profile_heter_ulysses == 'memory':
+                self.heter_ulysses_mem_config_path = \
+                    f"examples/profile/models/configs/profile_memory_{heter_ulysses_model_name}.json"
+                self.hu_mem_config_dict = json.load(open(self.heter_ulysses_mem_config_path, "r", encoding="utf-8")) \
+                    if os.path.exists(self.heter_ulysses_mem_config_path) else {}
             self.profile_iter = 0
 
         self.flash_attention = FlashAttention(
@@ -8237,15 +8244,15 @@ class DotProductAttention(TransformerEngineBaseModule):
 
             heter_ulysses_time_profile_config_key = None
             heter_ulysses_mem_profile_config_key = None
-            should_profile_memory = None
-            if self.profile_heter_ulysses:
+            if self.profile_heter_ulysses != 'none':
                 bsz = query_layer.shape[1]
-                heter_ulysses_time_profile_config_key = \
-                    f'attn_time_gpu_type{self.gpu_type_id}_seqlen{self.seqlen_tot}' \
-                    f'_gqa_group{self.num_gqa_groups}_iter{self.profile_iter}_bsz{bsz}'
-                should_profile_memory = self.gpu_type_id == 0
-                heter_ulysses_mem_profile_config_key = \
-                    f'iter{self.profile_iter} seqlen{self.seqlen_tot}_gqa_group{self.num_gqa_groups}_bsz{bsz}'
+                if self.profile_heter_ulysses == 'time':
+                    heter_ulysses_time_profile_config_key = \
+                        f'attn_time_gpu_type{self.gpu_type_id}_seqlen{self.seqlen_tot}' \
+                        f'_gqa_group{self.num_gqa_groups}_iter{self.profile_iter}_bsz{bsz}'
+                if self.profile_heter_ulysses == 'memory':
+                    heter_ulysses_mem_profile_config_key = \
+                        f'iter{self.profile_iter} seqlen{self.seqlen_tot}_gqa_group{self.num_gqa_groups}_bsz{bsz}'
                 self.profile_iter += 1
 
             if self.fp8:
@@ -8625,7 +8632,6 @@ class DotProductAttention(TransformerEngineBaseModule):
                     heter_ulysses_time_profile_config_key=heter_ulysses_time_profile_config_key,
                     heter_ulysses_mem_profile_config_dict=self.hu_mem_config_dict,
                     heter_ulysses_mem_profile_config_key=heter_ulysses_mem_profile_config_key,
-                    should_profile_memory=should_profile_memory,
                 )
 
             if use_fused_attention:
