@@ -7893,16 +7893,9 @@ class DotProductAttention(TransformerEngineBaseModule):
         self.hu_mem_config_dict = None
         if profile_heter_ulysses != 'none':
             if profile_heter_ulysses == 'time':
-                self.heter_ulysses_time_config_path = f"examples/profile/models/configs/" \
-                                            f"profile_time_{heter_ulysses_model_name}_gputype{gpu_type_id}.json"
-                self.hu_time_config_dict = \
-                    json.load(open(self.heter_ulysses_time_config_path, "r", encoding="utf-8")) \
-                    if os.path.exists(self.heter_ulysses_time_config_path) else {}
+                self.hu_time_config_dict = {}
             if profile_heter_ulysses == 'memory':
-                self.heter_ulysses_mem_config_path = \
-                    f"examples/profile/models/configs/profile_memory_{heter_ulysses_model_name}.json"
-                self.hu_mem_config_dict = json.load(open(self.heter_ulysses_mem_config_path, "r", encoding="utf-8")) \
-                    if os.path.exists(self.heter_ulysses_mem_config_path) else {}
+                self.hu_mem_config_dict = {}
             self.profile_iter = 0
 
         self.flash_attention = FlashAttention(
